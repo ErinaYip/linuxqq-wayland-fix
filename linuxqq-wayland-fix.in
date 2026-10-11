@@ -12,6 +12,7 @@
 #   QQ_WAYLAND_FIX_QQ         QQ 的启动命令（默认先找 PATH 里的 linuxqq，再找 /opt/QQ/qq）
 #   QQ_WAYLAND_FIX_LOG        日志文件（默认 $XDG_RUNTIME_DIR/linuxqq-wayland-fix.log）
 #   QQ_WAYLAND_FIX_ANGLE      ANGLE 后端：auto（默认，检测到 Vulkan 时用 vulkan）| vulkan | swiftshader | off
+#                             auto 下 vulkan 画不出窗口时会自动改用默认后端重开，并记住这块显卡（QQ 更新后重试）
 #   VK_DRIVER_FILES           Vulkan 设备列表。混合显卡下不设时，启动器会自动限定到显示 GPU
 #                             （规避观看共享花屏，见 docs/原理详解.md#附观看共享花屏）；自己设了就不动
 #   QQ_WL_NATIVE_DISABLE=1    关闭屏幕共享修复（排查问题用）
@@ -34,6 +35,7 @@ BORDERFIX_LIB="$LIBDIR/libqq-borderfix.so"
 LOG="${QQ_WAYLAND_FIX_LOG:-${XDG_RUNTIME_DIR:-/tmp}/linuxqq-wayland-fix.log}"
 QQ_CRASH_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/QQ/crash_files"
 CRASH_KEEP="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-wayland-fix/crash"
+ANGLE_FALLBACK="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-wayland-fix/angle-vulkan-failed"
 USER_APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 QQ_DESKTOP_IDS=(qq.desktop linuxqq.desktop)
 FIX_DESKTOP_ID=linuxqq-wayland-fix.desktop
@@ -296,7 +298,7 @@ vulkan_available() {
 angle_mode() {
     case "${QQ_WAYLAND_FIX_ANGLE:-auto}" in
         auto)
-            if vulkan_available; then echo vulkan; else echo none; fi
+            if vulkan_available && ! angle_vulkan_failed; then echo vulkan; else echo none; fi
             ;;
         vulkan | swiftshader) echo "${QQ_WAYLAND_FIX_ANGLE}" ;;
         off | default | none | "") echo none ;;
@@ -304,25 +306,51 @@ angle_mode() {
     esac
 }
 
-# 显示 GPU 的 vendor：优先找有接通（connected）接口的 DRM card，取不到退回 boot_vga。
-display_gpu_vendor() {
+# 显示 GPU 的设备目录：优先找有接通（connected）接口的 DRM card，取不到退回 boot_vga。
+display_gpu_dev() {
     local c s
     for c in /sys/class/drm/card[0-9]*; do
         [[ -e "$c/device/vendor" ]] || continue
         for s in "$c"/card*-*/status; do
             if [[ -f "$s" && "$(cat "$s" 2>/dev/null)" == "connected" ]]; then
-                cat "$c/device/vendor"
+                echo "$c/device"
                 return 0
             fi
         done
     done
     for c in /sys/bus/pci/devices/*/boot_vga; do
         if [[ -f "$c" && "$(cat "$c" 2>/dev/null)" == "1" ]]; then
-            cat "$(dirname "$c")/vendor"
+            dirname "$c"
             return 0
         fi
     done
     return 1
+}
+
+display_gpu_vendor() {
+    local d
+    d=$(display_gpu_dev) || return 1
+    cat "$d/vendor"
+}
+
+# ANGLE Vulkan 在部分显卡上画不出窗口（issue #48：Intel 核显上 Skia 建不了 SkSurface，GPU 进程连崩，
+# 登录窗口始终不出来）。auto 模式遇到时会记下「显示 GPU + QQ 安装版本」，之后在这台机器上不再用 vulkan。
+# QQ 自带的 Chromium/ANGLE 只随安装包更新（热更新不换），所以取安装目录的版本；AppImage 取文件名。
+angle_fallback_key() {
+    local d gpu=unknown ver f
+    d=$(display_gpu_dev) && gpu="$(cat "$d/vendor"):$(cat "$d/device")"
+    ver=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' /opt/QQ/resources/app/package.json 2>/dev/null | head -1)
+    if [[ -z "$ver" ]]; then
+        for f in /opt/linuxqq-appimage/*.AppImage; do
+            [[ -f "$f" ]] && { ver=${f##*/}; break; }
+        done
+    fi
+    echo "gpu=$gpu qq=${ver:-unknown}"
+}
+
+# 这块显卡 + 这个 QQ 版本上 ANGLE Vulkan 失败过（QQ 更新后记录自然失效，会重新尝试）。
+angle_vulkan_failed() {
+    [[ -f "$ANGLE_FALLBACK" && "$(head -1 "$ANGLE_FALLBACK" 2>/dev/null)" == "$(angle_fallback_key)" ]]
 }
 
 # 混合显卡规避（见 docs/原理详解.md#附观看共享花屏）：只要 NVIDIA 的 Vulkan 设备可枚举，
@@ -344,6 +372,44 @@ restrict_vulkan_icds() {
     local IFS=:
     export VK_DRIVER_FILES="${icds[*]}"
     return 0
+}
+
+process_alive() {
+    local st
+    st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    st=${st##*) }
+    [[ "${st%% *}" != Z ]]
+}
+
+# 启动阶段的监视（后台运行；$1 是 QQ 主进程，即 exec 之前的启动器自己，其余是 QQ 的参数）：
+# 20 秒内 GPU 进程因为建不了 SkSurface 崩了两次以上，就记下这块显卡（angle_fallback_key），
+# 结束 QQ，改用默认后端重开。日志每次启动都会截断，所以直接数整个文件。
+watch_angle_vulkan() {
+    local qq_pid=$1 i preload=${LD_PRELOAD-}
+    shift
+    unset LD_PRELOAD # 注入库只给 QQ，这里的 sleep/awk 不需要
+    for ((i = 0; i < 40; i++)); do
+        sleep 0.5
+        process_alive "$qq_pid" || return 0
+        LC_ALL=C awk '/Unable to initialize SkSurface/ { s++ }
+                      /GPU process exited unexpectedly/ { g++ }
+                      END { exit !(s >= 1 && g >= 2) }' "$LOG" && break
+    done
+    (( i < 40 )) || return 0
+
+    mkdir -p "${ANGLE_FALLBACK%/*}" && angle_fallback_key > "$ANGLE_FALLBACK"
+    echo "=== linuxqq-wayland-fix: ANGLE Vulkan 画不出窗口（GPU 进程反复崩溃），改用默认后端重开 QQ；已记录到 $ANGLE_FALLBACK"
+    kill -TERM "$qq_pid" 2>/dev/null
+    for ((i = 0; i < 50; i++)); do
+        process_alive "$qq_pid" || break
+        sleep 0.2
+    done
+    if process_alive "$qq_pid"; then
+        kill -KILL "$qq_pid" 2>/dev/null
+        sleep 1
+    fi
+    export LD_PRELOAD="$preload"
+    exec "$QQ" --ozone-platform=wayland "$@"
 }
 
 # KDE Plasma 自带 XWayland↔Wayland 剪贴板同步（KWin/Klipper），与我们的桥冲突会让 QQ 崩溃，
@@ -555,7 +621,13 @@ doctor() {
     case "$(angle_mode)" in
         vulkan) pass "ANGLE 后端: vulkan（检测到 Vulkan，可规避观看共享花屏）" ;;
         swiftshader) note "ANGLE 后端: swiftshader（软件渲染，较慢，由 QQ_WAYLAND_FIX_ANGLE 指定）" ;;
-        none) note "ANGLE 后端: 默认；若观看共享花屏，可设 QQ_WAYLAND_FIX_ANGLE=swiftshader（较慢）或改用 X11，见 docs/原理详解.md#附观看共享花屏" ;;
+        none)
+            if [[ "${QQ_WAYLAND_FIX_ANGLE:-auto}" == auto ]] && vulkan_available && angle_vulkan_failed; then
+                note "ANGLE 后端: 默认（vulkan 在这块显卡上画不出窗口，已自动改用默认后端；QQ 更新后会重新尝试，删除 $(tilde "$ANGLE_FALLBACK") 可立即重试）"
+            else
+                note "ANGLE 后端: 默认；若观看共享花屏，可设 QQ_WAYLAND_FIX_ANGLE=swiftshader（较慢）或改用 X11，见 docs/原理详解.md#附观看共享花屏"
+            fi
+            ;;
     esac
     if [[ "$(angle_mode)" == "vulkan" ]] && grep -qli nvidia /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json 2>/dev/null; then
         local dgv
@@ -815,4 +887,10 @@ fi
 
 keep_crash_records
 { echo "=== linuxqq-wayland-fix $VERSION $(date '+%F %T') $QQ $* angle=$(angle_mode) icd=$icd_note clipboard=$(clipboard_state)"; } >"$LOG" 2>/dev/null || LOG=/dev/null
+
+# auto 选了 vulkan 时盯住启动阶段（见 angle_fallback_key）。用双重 fork 脱离 QQ：
+# 监视进程不做 QQ 的子进程，退出时不会在 QQ 下面留僵尸。
+if [[ "${angle_arg[*]}" == --use-angle=vulkan && "${QQ_WAYLAND_FIX_ANGLE:-auto}" == auto && "$LOG" != /dev/null ]]; then
+    ( watch_angle_vulkan "$$" "$@" </dev/null >>"$LOG" 2>&1 & )
+fi
 exec "$QQ" --ozone-platform=wayland "${angle_arg[@]}" "$@" >>"$LOG" 2>&1
