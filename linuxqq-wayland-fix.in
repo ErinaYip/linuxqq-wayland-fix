@@ -16,6 +16,7 @@
 #   VK_DRIVER_FILES           Vulkan 设备列表。混合显卡下不设时，启动器会自动限定到显示 GPU
 #                             （规避观看共享花屏，见 docs/原理详解.md#附观看共享花屏）；自己设了就不动
 #   QQ_WL_NATIVE_DISABLE=1    关闭屏幕共享修复（排查问题用）
+#   QQ_WL_DMABUF=linear      实验：协商单平面 LINEAR DMA-BUF，使用 QQ 自带 EGL 导入（默认关闭）
 #   QQ_WL_FRAME_REUSE_DISABLE=1 关闭「复用采集纹理」（排查共享时内存增长用）
 #   QQ_VOICE_LATENCY_MSEC     语音通话麦克风的录音缓冲毫秒数（默认 30；0 关闭，回到 QQ 原本的 2 秒）
 #   QQ_CLIPBOARD_FIX_DISABLE=1 关闭剪贴板修复（排查问题用）

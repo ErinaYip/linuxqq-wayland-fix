@@ -56,6 +56,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <link.h>
+#include <limits.h>
 #include <unistd.h>
 
 #define LOG(...) fprintf(stderr, "[qq-wl-portal pid=%ld] " __VA_ARGS__), \
@@ -456,6 +457,10 @@ static struct pw_core *wrap_connect_fd(struct pw_context *context, int fd,
     return core;
 }
 
+static int connect_linear_dmabuf(struct pw_stream *stream, int direction,
+                                 uint32_t target_id, int flags,
+                                 const struct spa_pod **params, uint32_t n_params);
+
 static int wrap_stream_connect(struct pw_stream *stream, int direction,
                                uint32_t target_id, int flags,
                                const struct spa_pod **params,
@@ -469,8 +474,8 @@ static int wrap_stream_connect(struct pw_stream *stream, int direction,
         LOG("stream connect target %u -> %u", (long)getpid(), target_id, node);
         target_id = node;
     }
-    return real_stream_connect(stream, direction, target_id, flags, params,
-                               n_params);
+    return connect_linear_dmabuf(stream, direction, target_id, flags, params,
+                                 n_params);
 }
 
 static int wrap_core_disconnect(struct pw_core *core)
@@ -534,6 +539,9 @@ struct stream_info {
     void *capture;
     uint32_t alloc_w, alloc_h;
     int reuse_logged;
+    /* 实验开关 QQ_WL_DMABUF=linear：只用 QQ 已有的单平面 EGL 导入路径。 */
+    void *dmabuf_capture;
+    int dmabuf_linear, dmabuf_ready, dmabuf_buffer_logged, dmabuf_invalidate;
 };
 
 static pthread_mutex_t streams_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -567,6 +575,18 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     s->width = raw.size.width;
     s->height = raw.size.height;
     s->logged_stride = 0;
+    if (s->dmabuf_linear) {
+        const struct spa_pod_prop *mod = spa_pod_find_prop(param, NULL,
+                                                          SPA_FORMAT_VIDEO_modifier);
+        int64_t value = mod ? (int64_t)raw.modifier : -1;
+        s->dmabuf_ready = mod && !(mod->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) &&
+            (raw.flags & SPA_VIDEO_FLAG_MODIFIER) && value == 0 &&
+            raw.format == SPA_VIDEO_FORMAT_BGRx;
+        s->dmabuf_invalidate = 1;
+        LOG("DMA-BUF format: %ux%u format=%u modifier=%#llx ready=%d",
+            (long)getpid(), raw.size.width, raw.size.height, raw.format,
+            (unsigned long long)value, s->dmabuf_ready);
+    }
     /*
      * 第 7 节：尺寸不变时格式也可能变（换像素格式、带不带 modifier 即 SHM/DMA-BUF），
      * 而 QQ 建纹理用的格式、swizzle、要不要建 PBO 都取决于它，所以每次重新协商都放行一次重建。
@@ -582,6 +602,7 @@ static const struct pw_stream_events stride_events = {
 };
 
 static void *frame_reuse_capture(const struct pw_stream_events *events, void *data);
+static void *linear_dmabuf_capture(const struct pw_stream_events *events, void *data);
 
 static int wrap_add_listener(struct pw_stream *stream, struct spa_hook *hook,
                              const struct pw_stream_events *events, void *data)
@@ -593,6 +614,7 @@ static int wrap_add_listener(struct pw_stream *stream, struct spa_hook *hook,
         if (s) {
             s->stream = stream;
             s->capture = frame_reuse_capture(events, data);
+            s->dmabuf_capture = linear_dmabuf_capture(events, data);
             /* 在 QQ 自己的监听器之后注册，param_changed 时两者都会收到。 */
             real_add_listener(stream, &s->hook, &stride_events, s);
             pthread_mutex_lock(&streams_lock);
@@ -711,6 +733,166 @@ static void *frame_reuse_capture(const struct pw_stream_events *events, void *da
     return data;
 }
 
+/* QQ 3.2.34：EGLDisplay 在 +0x10，DMA-BUF 导入缓存的 fd 在 +0x1f4。 */
+static void *linear_dmabuf_capture(const struct pw_stream_events *events, void *data)
+{
+    const char *mode = lookup_env("QQ_WL_DMABUF");
+    if (!mode || strcmp(mode, "linear"))
+        return NULL;
+#if defined(__x86_64__)
+    if (data && events && capture_code_known((const void *)events->process)) {
+        const uint8_t *code = (const uint8_t *)events->process;
+        if (!memcmp(code + 0x269, "\x39\x83\xf4\x01\x00\x00", 6) &&
+            !memcmp(code + 0x2ab, "\x48\x8b\x7b\x10", 4))
+            return data;
+    }
+#else
+    (void)events; (void)data;
+#endif
+    LOG("DMA-BUF linear disabled: unknown QQ capture layout", (long)getpid());
+    return NULL;
+}
+
+static int has_egl_extension(const char *extensions, const char *name)
+{
+    size_t len = strlen(name);
+    const char *p = extensions;
+    while (p && (p = strstr(p, name))) {
+        if ((p == extensions || p[-1] == ' ') && (p[len] == ' ' || !p[len]))
+            return 1;
+        p += len;
+    }
+    return 0;
+}
+
+/* 只查询 QQ 自己已初始化的 EGLDisplay；不创建/切换 GL context，不增加链接依赖。 */
+static int can_import_linear(void *display)
+{
+    typedef void (*egl_proc)(void);
+    typedef egl_proc (*get_proc_fn)(const char *);
+    typedef const char *(*query_string_fn)(void *, int);
+    typedef unsigned int (*query_formats_fn)(void *, int, int *, int *);
+    typedef unsigned int (*query_modifiers_fn)(void *, int, int, uint64_t *,
+                                               unsigned int *, int *);
+    void *egl = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!egl || !display) {
+        if (egl) dlclose(egl);
+        return 0;
+    }
+    query_string_fn query = (query_string_fn)dlsym(egl, "eglQueryString");
+    get_proc_fn proc = (get_proc_fn)dlsym(egl, "eglGetProcAddress");
+    int result = 0;
+    const char *ext = query ? query(display, 0x3055 /* EGL_EXTENSIONS */) : NULL;
+    if (!proc || !has_egl_extension(ext, "EGL_EXT_image_dma_buf_import") ||
+        !has_egl_extension(ext, "EGL_EXT_image_dma_buf_import_modifiers"))
+        goto out;
+    query_formats_fn formats = (query_formats_fn)proc("eglQueryDmaBufFormatsEXT");
+    query_modifiers_fn modifiers = (query_modifiers_fn)proc("eglQueryDmaBufModifiersEXT");
+    if (!formats || !modifiers || !proc("eglCreateImageKHR") ||
+        !proc("glEGLImageTargetTexture2DOES"))
+        goto out;
+    int fmts[256], nf = 0, nm = 0, found = 0;
+    uint64_t mods[256];
+    unsigned int external[256];
+    /* DRM_FORMAT_XRGB8888；QQ 把 SPA BGRx 转成这个 fourcc。 */
+    const int xrgb = 0x34325258;
+    if (!formats(display, 256, fmts, &nf) || nf < 0 || nf > 256)
+        goto out;
+    for (int i = 0; i < nf; ++i)
+        if (fmts[i] == xrgb) found = 1;
+    if (!found || !modifiers(display, xrgb, 256, mods, external, &nm) ||
+        nm < 0 || nm > 256)
+        goto out;
+    for (int i = 0; i < nm; ++i)
+        if (mods[i] == 0 && !external[i]) result = 1;
+out:
+    dlclose(egl);
+    return result;
+}
+
+/* 保留 QQ 的尺寸、帧率等限制；仅把 BGRx + LINEAR 作为候选格式。 */
+static struct spa_pod *linear_dmabuf_format(const struct spa_pod *param)
+{
+    uint32_t media, subtype, count, choice;
+    const struct spa_pod_prop *prop;
+    if (!param || spa_format_parse(param, &media, &subtype) < 0 ||
+        media != SPA_MEDIA_TYPE_video || subtype != SPA_MEDIA_SUBTYPE_raw ||
+        SPA_POD_OBJECT_ID(param) != SPA_PARAM_EnumFormat ||
+        spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier))
+        return NULL;
+    prop = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_format);
+    if (!prop)
+        return NULL;
+    const struct spa_pod *values = spa_pod_get_values(&prop->value, &count, &choice);
+    if (!values || !spa_pod_is_id(values) ||
+        (choice != SPA_CHOICE_None && choice != SPA_CHOICE_Enum))
+        return NULL;
+    const uint32_t *ids = SPA_POD_BODY_CONST(values);
+    int bgrx = 0;
+    for (uint32_t i = 0; i < count; ++i)
+        if (ids[i] == SPA_VIDEO_FORMAT_BGRx) bgrx = 1;
+    if (!bgrx || SPA_POD_SIZE(param) > 65536)
+        return NULL;
+    uint32_t size = SPA_POD_SIZE(param) + 64;
+    void *storage = malloc(size);
+    if (!storage)
+        return NULL;
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(storage, size);
+    struct spa_pod_frame frame;
+    spa_pod_builder_push_object(&b, &frame, SPA_POD_OBJECT_TYPE(param),
+                                SPA_POD_OBJECT_ID(param));
+    SPA_POD_OBJECT_FOREACH((const struct spa_pod_object *)param, prop) {
+        if (prop->key == SPA_FORMAT_VIDEO_format) {
+            spa_pod_builder_prop(&b, prop->key, prop->flags);
+            spa_pod_builder_id(&b, SPA_VIDEO_FORMAT_BGRx);
+        } else {
+            spa_pod_builder_raw_padded(&b, prop, SPA_POD_PROP_SIZE(prop));
+        }
+    }
+    spa_pod_builder_prop(&b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+    spa_pod_builder_long(&b, 0 /* DRM_FORMAT_MOD_LINEAR */);
+    struct spa_pod *result = spa_pod_builder_pop(&b, &frame);
+    if (!result) free(storage);
+    return result;
+}
+
+static int connect_linear_dmabuf(struct pw_stream *stream, int direction,
+                                 uint32_t target_id, int flags,
+                                 const struct spa_pod **params, uint32_t n_params)
+{
+    struct stream_info *s = find_stream(stream);
+    if (!s || !s->dmabuf_capture || !params || !n_params || n_params > 64)
+        goto original;
+    void *display = *(void **)((char *)s->dmabuf_capture + 0x10);
+    if (!can_import_linear(display)) {
+        LOG("DMA-BUF linear disabled: QQ EGLDisplay cannot import XRGB8888 LINEAR as TEXTURE_2D",
+            (long)getpid());
+        goto original;
+    }
+    /* Keep the original SHM formats as fallback offers for other producers. */
+    const struct spa_pod *offers[128];
+    struct spa_pod *owned[64];
+    uint32_t n = 0, added = 0;
+    for (uint32_t i = 0; i < n_params; ++i) {
+        struct spa_pod *dma = linear_dmabuf_format(params[i]);
+        if (dma) {
+            owned[added++] = dma;
+            offers[n++] = dma;
+        }
+        offers[n++] = params[i];
+    }
+    if (!added)
+        goto original;
+    s->dmabuf_linear = 1;
+    LOG("DMA-BUF offer: BGRx modifier=0 (LINEAR), QQ native single-plane import; %u fallback params",
+        (long)getpid(), n_params);
+    int result = real_stream_connect(stream, direction, target_id, flags, offers, n);
+    for (uint32_t i = 0; i < added; ++i) free(owned[i]);
+    return result;
+original:
+    return real_stream_connect(stream, direction, target_id, flags, params, n_params);
+}
+
 static void keep_frame_buffers(struct stream_info *s, struct pw_stream *stream)
 {
     char *cap = s->capture;
@@ -754,6 +936,31 @@ static struct pw_buffer *wrap_dequeue(struct pw_stream *stream)
      * 这时若记下「已按新尺寸重建」，下一帧就会跳过真正需要的重建，所以只在有帧时处理。
      */
     s = find_stream(stream);
+    if (b && s && s->dmabuf_linear) {
+        struct spa_buffer *buffer = b->buffer;
+        struct spa_data *d = buffer && buffer->n_datas ? buffer->datas : NULL;
+        if (d && d->type == SPA_DATA_DmaBuf) {
+            if (buffer->n_datas != 1 || !s->dmabuf_ready || d->fd < 0 || d->fd > INT_MAX ||
+                !d->chunk || d->chunk->stride < 0 ||
+                (uint64_t)d->chunk->stride < (uint64_t)s->width * 4) {
+                if (s->dmabuf_buffer_logged != -1)
+                    LOG("DMA-BUF frame rejected: planes=%u ready=%d; check fd/stride/chunk",
+                        (long)getpid(), buffer->n_datas, s->dmabuf_ready);
+                s->dmabuf_buffer_logged = -1;
+                real_queue(stream, b);
+                return NULL;
+            }
+            if (s->dmabuf_invalidate) {
+                /* 格式/尺寸重协商时，即使 fd 号码相同也要重新导入。 */
+                *(int32_t *)((char *)s->dmabuf_capture + 0x1f4) = -1;
+                s->dmabuf_invalidate = 0;
+            }
+            if (s->dmabuf_buffer_logged != 1)
+                LOG("DMA-BUF frame: fd=%lld planes=1 stride=%d offset=%u modifier=0",
+                    (long)getpid(), (long long)d->fd, d->chunk->stride, d->chunk->offset);
+            s->dmabuf_buffer_logged = 1;
+        }
+    }
     if (b && s && s->capture && s->width && s->height && enabled())
         keep_frame_buffers(s, stream);
 
