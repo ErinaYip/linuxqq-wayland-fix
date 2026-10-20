@@ -594,7 +594,25 @@ doctor() {
         bad "找不到 $CLIPBOARD_LIB"
     fi
     [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
-    # 截图链（GNOME）：没有 wlr-screencopy，靠 helper 走门户。库里没有门户分支（0.2.10 之前的包）
+    # 截图链（wlroots 系 / niri / COSMIC 等）：靠合成器的截屏协议，ext-image-copy-capture 优先、
+    # wlr-screencopy 兜底。只在装了 wayland-info 时检查；COSMIC 只有 ext，0.2.21 及之前的库只认 wlr。
+    if [[ "${XDG_CURRENT_DESKTOP:-}" != *GNOME* && "${XDG_CURRENT_DESKTOP:-}" != *KDE* ]] &&
+        [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wayland-info >/dev/null 2>&1; then
+        local globals has_ext=0 has_wlr=0
+        globals=$(wayland-info 2>/dev/null)
+        [[ "$globals" == *"'ext_image_copy_capture_manager_v1'"* && "$globals" == *"'ext_output_image_capture_source_manager_v1'"* ]] && has_ext=1
+        [[ "$globals" == *"'zwlr_screencopy_manager_v1'"* ]] && has_wlr=1
+        if (( has_ext )) && [[ -r "$SCREENSHOT_LIB" ]] && grep -aq 'ext-image-copy-capture' "$SCREENSHOT_LIB"; then
+            pass "截图: 合成器支持 ext-image-copy-capture"
+        elif (( has_wlr )); then
+            pass "截图: 合成器支持 wlr-screencopy"
+        elif (( has_ext )); then
+            bad "截图: 合成器只有 ext-image-copy-capture，这份 libqq-screenshot.so 不支持，截图会全黑，请升级本包"
+        else
+            bad "截图: 合成器既没有 ext-image-copy-capture 也没有 wlr-screencopy，截图会全黑"
+        fi
+    fi
+    # 截图链（GNOME）：没有 Wayland 截屏协议，靠 helper 走门户。库里没有门户分支（0.2.10 之前的包）
     # 或 helper 缺失时，截图会静默地全黑，日志里才有原因。KDE 走 KWin ScreenShot2，在后面单独检查。
     if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then
         local sh_help="$LIBDIR/qq-screenshot-helper" sh_desk

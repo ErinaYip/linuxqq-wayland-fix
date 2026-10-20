@@ -43,7 +43,7 @@
 
   ![](./pics/截图闪退-before.gif)
 
-  这个仓库拦截了 QQ 截图操作，并将其改为 `wlr-screencopy` 截取显示输出。
+  这个仓库拦截了 QQ 截图操作，并将其改为用合成器的截屏协议（`ext-image-copy-capture`，没有时用 `wlr-screencopy`）截取显示输出。
 
   https://github.com/user-attachments/assets/36b6b031-19d0-4af2-9def-4e1a63a7ce11
   

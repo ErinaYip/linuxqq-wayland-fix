@@ -66,8 +66,10 @@ $(CB_LIB): $(CB_SRCS) src/clipbridge/clipbridge.h $(CB_GEN_H) $(CB_GEN_C)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden -Wall -Wextra -Ibuild $(CB_CFLAGS) \
 	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ $(CB_SRCS) $(CB_GEN_C) $(CB_LIBS) -lpthread -ldl
 
-# 截图修复：同样用 X11 与 wayland-client（wlr-screencopy）；KDE 下 fork/exec helper 调 KWin ScreenShot2
-SH_PROTOCOLS := wlr-screencopy-unstable-v1 xdg-output-unstable-v1
+# 截图修复：同样用 X11 与 wayland-client（ext-image-copy-capture，退回 wlr-screencopy）；
+# KDE 下 fork/exec helper 调 KWin ScreenShot2。ext-foreign-toplevel-list 只是 capture-source 引用到的接口定义
+SH_PROTOCOLS := ext-image-capture-source-v1 ext-image-copy-capture-v1 ext-foreign-toplevel-list-v1 \
+                wlr-screencopy-unstable-v1 xdg-output-unstable-v1
 SH_GEN_H   := $(SH_PROTOCOLS:%=build/%-client-protocol.h)
 SH_GEN_C   := $(SH_PROTOCOLS:%=build/%-protocol.c)
 

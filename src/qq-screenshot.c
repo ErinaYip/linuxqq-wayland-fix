@@ -8,8 +8,10 @@
  * Xlib 打印错误后返回 NULL，QQ 不检查就去读像素，段错误。
  *
  * 这里只处理对根窗口的截取（别的窗口照常交给 Xlib）：
- *   1. 在 Wayland 会话里（有 WAYLAND_DISPLAY），通过 wlr-screencopy 逐个截取 Wayland 输出，
- *      按 X 的显示器布局（XRandR monitors，名字与 wl_output 名字对应）拼成根窗口坐标系下的画面。
+ *   1. 在 Wayland 会话里（有 WAYLAND_DISPLAY），逐个截取 Wayland 输出，按 X 的显示器布局
+ *      （XRandR monitors，名字与 wl_output 名字对应）拼成根窗口坐标系下的画面。
+ *      优先用 ext-image-copy-capture（COSMIC 只有它），合成器没有或截取失败时退回
+ *      wlr-screencopy（Hyprland、Wayfire 等只有它）；
  *      XShmGetImage 在 rootless XWayland 上不报错、只给全黑，所以不能「X 失败了再截」；
  *   2. KDE（KWin）没有 wlr-screencopy：fork/exec qq-screenshot-helper（kde 模式），
  *      由它调 org.kde.KWin.ScreenShot2.CaptureWorkspace（helper 自己的 .desktop
@@ -25,7 +27,8 @@
  * QQ_SCREENSHOT_FIX_DISABLE=1 关掉整个截图修复（含上面的换算）；
  * QQ_SCREENSHOT_KDE=0 只关 KDE 路径，=1 强制走 KDE（测试用）；
  * QQ_SCREENSHOT_PORTAL=1/0 强制开/关 portal 路径（默认仅 GNOME 会话启用）；
- * QQ_SCREENSHOT_HELPER 覆盖 helper 路径（测试用）。
+ * QQ_SCREENSHOT_HELPER 覆盖 helper 路径（测试用）；
+ * QQ_SCREENSHOT_PROTOCOL=ext/wlr 只用其中一种 Wayland 截屏协议（测试用）。
  */
 #define _GNU_SOURCE
 #include <X11/Xlib.h>
@@ -47,6 +50,8 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+#include "ext-image-capture-source-v1-client-protocol.h"
+#include "ext-image-copy-capture-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 
@@ -74,8 +79,11 @@ struct capture {
     struct wl_display *dpy;
     struct wl_shm *shm;
     struct zwlr_screencopy_manager_v1 *mgr;
+    struct ext_output_image_capture_source_manager_v1 *ext_src_mgr;
+    struct ext_image_copy_capture_manager_v1 *ext_mgr;
     struct zxdg_output_manager_v1 *xdg_mgr;
     struct output *outputs;
+    const char *proto; /* 实际截到画面所用的协议，写日志用 */
 };
 
 static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph,
@@ -118,6 +126,10 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t id, const cha
         c->shm = wl_registry_bind(r, id, &wl_shm_interface, 1);
     } else if (!strcmp(iface, zwlr_screencopy_manager_v1_interface.name)) {
         c->mgr = wl_registry_bind(r, id, &zwlr_screencopy_manager_v1_interface, ver < 3 ? ver : 3);
+    } else if (!strcmp(iface, ext_output_image_capture_source_manager_v1_interface.name)) {
+        c->ext_src_mgr = wl_registry_bind(r, id, &ext_output_image_capture_source_manager_v1_interface, 1);
+    } else if (!strcmp(iface, ext_image_copy_capture_manager_v1_interface.name)) {
+        c->ext_mgr = wl_registry_bind(r, id, &ext_image_copy_capture_manager_v1_interface, 1);
     } else if (!strcmp(iface, zxdg_output_manager_v1_interface.name)) {
         c->xdg_mgr = wl_registry_bind(r, id, &zxdg_output_manager_v1_interface, 1);
     } else if (!strcmp(iface, wl_output_interface.name)) {
@@ -150,7 +162,7 @@ static const struct zxdg_output_v1_listener xdg_output_listener = {
 static const struct wl_registry_listener registry_listener = { reg_global, reg_remove };
 
 struct frame {
-    uint32_t format, w, h, stride;
+    uint32_t format, w, h, stride, fail_reason;
     int have_buffer, buffer_done, ready, failed, y_invert;
 };
 
@@ -225,7 +237,147 @@ static int dispatch_until(struct wl_display *dpy, int *flag, int *fail, int time
     return *flag ? 0 : -1;
 }
 
-static int capture_output(struct capture *c, struct output *o)
+/* 建一块 shm buffer，返回映射地址；失败返回 NULL。 */
+static uint8_t *shm_buffer(struct capture *c, uint32_t w, uint32_t h, uint32_t stride, uint32_t format,
+                           struct wl_buffer **buf)
+{
+    size_t size = (size_t)stride * h;
+    int fd = memfd_create("qq-screenshot", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, size) < 0) {
+        if (fd >= 0)
+            close(fd);
+        return NULL;
+    }
+    uint8_t *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+    struct wl_shm_pool *pool = wl_shm_create_pool(c->shm, fd, size);
+    *buf = wl_shm_pool_create_buffer(pool, 0, w, h, stride, format);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return map;
+}
+
+/* 把截到的 buffer 转成 0x00RRGGBB 存进 o->pix。 */
+static int store_pixels(struct output *o, const uint8_t *map, const struct frame *fr)
+{
+    if (!(o->pix = malloc((size_t)fr->w * fr->h * 4)))
+        return -1;
+    int swap = fr->format == WL_SHM_FORMAT_XBGR8888 || fr->format == WL_SHM_FORMAT_ABGR8888;
+    for (uint32_t y = 0; y < fr->h; y++) {
+        const uint32_t *src = (const uint32_t *)(map + (size_t)(fr->y_invert ? fr->h - 1 - y : y) * fr->stride);
+        uint32_t *dst = o->pix + (size_t)y * fr->w;
+        for (uint32_t x = 0; x < fr->w; x++) {
+            uint32_t p = src[x];
+            if (swap)
+                p = (p & 0x0000ff00) | ((p & 0xff) << 16) | ((p >> 16) & 0xff);
+            dst[x] = p & 0x00ffffff;
+        }
+    }
+    o->w = fr->w;
+    o->h = fr->h;
+    return 0;
+}
+
+/* ---- ext-image-copy-capture ---- */
+
+static void es_buffer_size(void *d, struct ext_image_copy_capture_session_v1 *s, uint32_t w, uint32_t h)
+{
+    struct frame *fr = d;
+    (void)s;
+    fr->w = w;
+    fr->h = h;
+}
+static void es_shm_format(void *d, struct ext_image_copy_capture_session_v1 *s, uint32_t format)
+{
+    struct frame *fr = d;
+    (void)s;
+    if (!fr->have_buffer && supported_format(format)) {
+        fr->format = format;
+        fr->have_buffer = 1;
+    }
+}
+static void es_dmabuf_device(void *d, struct ext_image_copy_capture_session_v1 *s, struct wl_array *a)
+{ (void)d; (void)s; (void)a; }
+static void es_dmabuf_format(void *d, struct ext_image_copy_capture_session_v1 *s, uint32_t f, struct wl_array *m)
+{ (void)d; (void)s; (void)f; (void)m; }
+static void es_done(void *d, struct ext_image_copy_capture_session_v1 *s) { (void)s; ((struct frame *)d)->buffer_done = 1; }
+static void es_stopped(void *d, struct ext_image_copy_capture_session_v1 *s) { (void)s; ((struct frame *)d)->failed = 1; }
+
+static const struct ext_image_copy_capture_session_v1_listener ext_session_listener = {
+    .buffer_size = es_buffer_size, .shm_format = es_shm_format, .dmabuf_device = es_dmabuf_device,
+    .dmabuf_format = es_dmabuf_format, .done = es_done, .stopped = es_stopped,
+};
+
+static void ef_transform(void *d, struct ext_image_copy_capture_frame_v1 *f, uint32_t t)
+{
+    struct frame *fr = d;
+    (void)f;
+    /* 与 wlr 那边一致只处理上下翻转（wlr 的 y_invert 在这里表示为 flipped_180）；旋转的输出两边都不转 */
+    fr->y_invert = t == WL_OUTPUT_TRANSFORM_FLIPPED_180;
+}
+static void ef_damage(void *d, struct ext_image_copy_capture_frame_v1 *f, int32_t x, int32_t y, int32_t w, int32_t h)
+{ (void)d; (void)f; (void)x; (void)y; (void)w; (void)h; }
+static void ef_presentation(void *d, struct ext_image_copy_capture_frame_v1 *f, uint32_t a, uint32_t b, uint32_t c)
+{ (void)d; (void)f; (void)a; (void)b; (void)c; }
+static void ef_ready(void *d, struct ext_image_copy_capture_frame_v1 *f) { (void)f; ((struct frame *)d)->ready = 1; }
+static void ef_failed(void *d, struct ext_image_copy_capture_frame_v1 *f, uint32_t reason)
+{
+    struct frame *fr = d;
+    (void)f;
+    fr->failed = 1;
+    fr->fail_reason = reason;
+}
+
+static const struct ext_image_copy_capture_frame_v1_listener ext_frame_listener = {
+    .transform = ef_transform, .damage = ef_damage, .presentation_time = ef_presentation,
+    .ready = ef_ready, .failed = ef_failed,
+};
+
+static int capture_output_ext(struct capture *c, struct output *o)
+{
+    struct frame fr = { 0 };
+    int ret = -1;
+    struct ext_image_capture_source_v1 *src =
+        ext_output_image_capture_source_manager_v1_create_source(c->ext_src_mgr, o->wl);
+    /* options=0：不画指针，与 wlr 那边 overlay_cursor=0 一致 */
+    struct ext_image_copy_capture_session_v1 *s =
+        ext_image_copy_capture_manager_v1_create_session(c->ext_mgr, src, 0);
+    ext_image_copy_capture_session_v1_add_listener(s, &ext_session_listener, &fr);
+    if (dispatch_until(c->dpy, &fr.buffer_done, &fr.failed, 2000) < 0 || !fr.have_buffer || !fr.w || !fr.h) {
+        LOG("output %s: ext-image-copy-capture: no usable shm format", o->name);
+        goto out_session;
+    }
+
+    fr.stride = fr.w * 4;
+    struct wl_buffer *buf = NULL;
+    uint8_t *map = shm_buffer(c, fr.w, fr.h, fr.stride, fr.format, &buf);
+    if (!map)
+        goto out_session;
+    struct ext_image_copy_capture_frame_v1 *f = ext_image_copy_capture_session_v1_create_frame(s);
+    ext_image_copy_capture_frame_v1_add_listener(f, &ext_frame_listener, &fr);
+    ext_image_copy_capture_frame_v1_attach_buffer(f, buf);
+    ext_image_copy_capture_frame_v1_damage_buffer(f, 0, 0, fr.w, fr.h);
+    ext_image_copy_capture_frame_v1_capture(f);
+    /* 会话的第一帧合成器必须立刻给，不会等画面变化 */
+    if (dispatch_until(c->dpy, &fr.ready, &fr.failed, 3000) == 0 && store_pixels(o, map, &fr) == 0)
+        ret = 0;
+    else
+        LOG("output %s: ext-image-copy-capture failed (reason %d)", o->name, fr.failed ? (int)fr.fail_reason : -1);
+    ext_image_copy_capture_frame_v1_destroy(f);
+    wl_buffer_destroy(buf);
+    munmap(map, (size_t)fr.stride * fr.h);
+out_session:
+    ext_image_copy_capture_session_v1_destroy(s);
+    ext_image_capture_source_v1_destroy(src);
+    return ret;
+}
+
+/* ---- wlr-screencopy ---- */
+
+static int capture_output_wlr(struct capture *c, struct output *o)
 {
     struct frame fr = { 0 };
     struct zwlr_screencopy_frame_v1 *f = zwlr_screencopy_manager_v1_capture_output(c->mgr, 0, o->wl);
@@ -238,49 +390,22 @@ static int capture_output(struct capture *c, struct output *o)
     else
         wl_display_roundtrip(c->dpy);
     if (!fr.have_buffer || fr.failed) {
-        LOG("output %s: no usable shm format", o->name);
+        LOG("output %s: wlr-screencopy: no usable shm format", o->name);
         goto out;
     }
 
-    size_t size = (size_t)fr.stride * fr.h;
-    int fd = memfd_create("qq-screenshot", MFD_CLOEXEC);
-    if (fd < 0 || ftruncate(fd, size) < 0) {
-        if (fd >= 0)
-            close(fd);
+    struct wl_buffer *buf = NULL;
+    uint8_t *map = shm_buffer(c, fr.w, fr.h, fr.stride, fr.format, &buf);
+    if (!map)
         goto out;
-    }
-    uint8_t *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        close(fd);
-        goto out;
-    }
-    struct wl_shm_pool *pool = wl_shm_create_pool(c->shm, fd, size);
-    struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0, fr.w, fr.h, fr.stride, fr.format);
-    wl_shm_pool_destroy(pool);
-    close(fd);
 
     zwlr_screencopy_frame_v1_copy(f, buf);
-    if (dispatch_until(c->dpy, &fr.ready, &fr.failed, 3000) == 0 &&
-        (o->pix = malloc((size_t)fr.w * fr.h * 4))) {
-        int swap = fr.format == WL_SHM_FORMAT_XBGR8888 || fr.format == WL_SHM_FORMAT_ABGR8888;
-        for (uint32_t y = 0; y < fr.h; y++) {
-            const uint32_t *src = (const uint32_t *)(map + (size_t)(fr.y_invert ? fr.h - 1 - y : y) * fr.stride);
-            uint32_t *dst = o->pix + (size_t)y * fr.w;
-            for (uint32_t x = 0; x < fr.w; x++) {
-                uint32_t p = src[x];
-                if (swap)
-                    p = (p & 0x0000ff00) | ((p & 0xff) << 16) | ((p >> 16) & 0xff);
-                dst[x] = p & 0x00ffffff;
-            }
-        }
-        o->w = fr.w;
-        o->h = fr.h;
+    if (dispatch_until(c->dpy, &fr.ready, &fr.failed, 3000) == 0 && store_pixels(o, map, &fr) == 0)
         ret = 0;
-    } else {
-        LOG("output %s: capture failed", o->name);
-    }
+    else
+        LOG("output %s: wlr-screencopy failed", o->name);
     wl_buffer_destroy(buf);
-    munmap(map, size);
+    munmap(map, (size_t)fr.stride * fr.h);
 out:
     zwlr_screencopy_frame_v1_destroy(f);
     return ret;
@@ -299,6 +424,10 @@ static void capture_free(struct capture *c)
     }
     if (c->mgr)
         zwlr_screencopy_manager_v1_destroy(c->mgr);
+    if (c->ext_mgr)
+        ext_image_copy_capture_manager_v1_destroy(c->ext_mgr);
+    if (c->ext_src_mgr)
+        ext_output_image_capture_source_manager_v1_destroy(c->ext_src_mgr);
     if (c->xdg_mgr)
         zxdg_output_manager_v1_destroy(c->xdg_mgr);
     if (c->shm)
@@ -320,13 +449,24 @@ static int capture_all(struct capture *c)
     wl_display_roundtrip(c->dpy);
     wl_display_roundtrip(c->dpy); /* wl_output.name */
     wl_registry_destroy(reg);
-    if (!c->mgr || !c->shm) {
-        LOG("compositor has no wlr-screencopy");
+    const char *want = getenv("QQ_SCREENSHOT_PROTOCOL");
+    int use_ext = c->ext_mgr && c->ext_src_mgr && !(want && !strcmp(want, "wlr"));
+    int use_wlr = c->mgr && !(want && !strcmp(want, "ext"));
+    if (!c->shm || (!use_ext && !use_wlr)) {
+        LOG("compositor has no ext-image-copy-capture or wlr-screencopy");
         return -1;
     }
     int got = 0;
-    for (struct output *o = c->outputs; o; o = o->next)
-        got += capture_output(c, o) == 0;
+    for (struct output *o = c->outputs; o; o = o->next) {
+        /* 每块屏各自回退：ext 截失败的屏再用 wlr 截一次 */
+        if (use_ext && capture_output_ext(c, o) == 0) {
+            c->proto = c->proto && strcmp(c->proto, "ext-image-copy-capture") ? "mixed" : "ext-image-copy-capture";
+            got++;
+        } else if (use_wlr && capture_output_wlr(c, o) == 0) {
+            c->proto = c->proto && strcmp(c->proto, "wlr-screencopy") ? "mixed" : "wlr-screencopy";
+            got++;
+        }
+    }
     return got ? 0 : -1;
 }
 
@@ -584,7 +724,7 @@ static int kde_usable(void)
 }
 
 /* portal 截图（org.freedesktop.portal.Screenshot）：GNOME 默认启用（KDE 有
- * ScreenShot2、wlroots 有 wlr-screencopy，都不走这条）；QQ_SCREENSHOT_PORTAL=1/0
+ * ScreenShot2、wlroots 系有 Wayland 截屏协议，都不走这条）；QQ_SCREENSHOT_PORTAL=1/0
  * 可强制开关（测试用）。 */
 static int portal_enabled(void)
 {
@@ -808,7 +948,7 @@ static uint32_t *monitor_image(Display *dpy, const char *name,
                 int found = 0;
                 for (struct output *o = c.outputs; o; o = o->next)
                     if (o->pix && !strcmp(o->name, name)) {
-                        LOG("single-monitor: %s %dx%d -> requested %dx%d", name, o->w, o->h, w, h);
+                        LOG("single-monitor: %s %dx%d -> requested %dx%d via %s", name, o->w, o->h, w, h, c.proto);
                         blit(pix, w, h, 0, 0, w, h, o);
                         found = 1;
                         break;
@@ -889,7 +1029,7 @@ static uint32_t *root_image(Display *dpy, Window root, int *w, int *h)
                         blit(pix, rw, rh, 0, 0, rw, rh, o);
                         break;
                     }
-            LOG("captured %ux%u root from Wayland (%d monitor(s) matched)", rw, rh, placed);
+            LOG("captured %ux%u root from Wayland via %s (%d monitor(s) matched)", rw, rh, c.proto, placed);
         }
     }
     capture_free(&c);
