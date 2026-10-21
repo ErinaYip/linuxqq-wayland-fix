@@ -114,4 +114,12 @@ clean:
 print-version:
 	@echo $(VERSION)
 
-.PHONY: all install clean print-version
+build/dmabuf-format-test: tools/dmabuf-format-test.c src/qq-wl-portal.c
+	@mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -Wno-nonnull-compare $(SS_CFLAGS) \
+	    -o $@ $< $(SS_LIBS) -ldl
+
+check-dmabuf: build/dmabuf-format-test
+	./build/dmabuf-format-test
+
+.PHONY: all install clean print-version check-dmabuf
