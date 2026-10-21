@@ -80,6 +80,22 @@ static void test_formats(void)
     CHECK(state.dmabuf_ready && state.dmabuf_invalidate);
     CHECK(state.width == 2560 && state.height == 1440);
     CHECK(memcmp(saved, qq, SPA_POD_SIZE(qq)) == 0);
+    /* 协商成共享内存时不算 DMA-BUF 就绪。 */
+    uint8_t shm_buf[2048], shm_neg[4096];
+    struct spa_pod_builder sb = SPA_POD_BUILDER_INIT(shm_buf, sizeof(shm_buf));
+    struct spa_pod *shm = spa_pod_builder_add_object(&sb, SPA_TYPE_OBJECT_Format,
+        SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
+        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&SPA_RECTANGLE(1920, 1080)),
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(0, 1)));
+    struct spa_pod_builder snb = SPA_POD_BUILDER_INIT(shm_neg, sizeof(shm_neg));
+    struct spa_pod *shm_format = NULL;
+    CHECK(spa_pod_filter(&snb, &shm_format, qq, shm) == 0);
+    CHECK(spa_pod_fixate(shm_format) == 0);
+    struct stream_info shm_state = { .dmabuf_linear = 1, .dmabuf_ready = 1 };
+    on_param_changed(&shm_state, SPA_PARAM_Format, shm_format);
+    CHECK(!shm_state.dmabuf_ready && shm_state.width == 1920);
     const struct spa_pod_prop *p = spa_pod_find_prop(dma, NULL, SPA_FORMAT_VIDEO_modifier);
     int64_t modifier = -1;
     CHECK(p && (p->flags & SPA_POD_PROP_FLAG_MANDATORY));

@@ -539,7 +539,7 @@ struct stream_info {
     void *capture;
     uint32_t alloc_w, alloc_h;
     int reuse_logged;
-    /* 实验开关 QQ_WL_DMABUF=linear：只用 QQ 已有的单平面 EGL 导入路径。 */
+    /* 只给 DMA-BUF 的合成器（niri 26.04）用：走 QQ 已有的单平面 EGL 导入路径。 */
     void *dmabuf_capture;
     int dmabuf_linear, dmabuf_ready, dmabuf_buffer_logged, dmabuf_invalidate;
 };
@@ -578,14 +578,15 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     if (s->dmabuf_linear) {
         const struct spa_pod_prop *mod = spa_pod_find_prop(param, NULL,
                                                           SPA_FORMAT_VIDEO_modifier);
-        int64_t value = mod ? (int64_t)raw.modifier : -1;
         s->dmabuf_ready = mod && !(mod->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) &&
-            (raw.flags & SPA_VIDEO_FLAG_MODIFIER) && value == 0 &&
+            (raw.flags & SPA_VIDEO_FLAG_MODIFIER) && raw.modifier == 0 &&
             raw.format == SPA_VIDEO_FORMAT_BGRx;
         s->dmabuf_invalidate = 1;
-        LOG("DMA-BUF format: %ux%u format=%u modifier=%#llx ready=%d",
-            (long)getpid(), raw.size.width, raw.size.height, raw.format,
-            (unsigned long long)value, s->dmabuf_ready);
+        /* 协商成共享内存时什么都不记，大多数合成器都走这条。 */
+        if (mod)
+            LOG("DMA-BUF format: %ux%u format=%u modifier=%#llx ready=%d",
+                (long)getpid(), raw.size.width, raw.size.height, raw.format,
+                (unsigned long long)raw.modifier, s->dmabuf_ready);
     }
     /*
      * 第 7 节：尺寸不变时格式也可能变（换像素格式、带不带 modifier 即 SHM/DMA-BUF），
@@ -733,11 +734,22 @@ static void *frame_reuse_capture(const struct pw_stream_events *events, void *da
     return data;
 }
 
+/*
+ * QQ_WL_DMABUF：不设时 LINEAR DMA-BUF 排在 QQ 原有格式之后，只在合成器不给共享内存时才会选中；
+ * off 关掉；first 排到最前（支持共享内存的合成器上也走 DMA-BUF，排查用）。
+ */
+static const char *dmabuf_mode(void)
+{
+    const char *mode = lookup_env("QQ_WL_DMABUF");
+    return mode && (!strcmp(mode, "off") || !strcmp(mode, "first")) ? mode : "auto";
+}
+
 /* QQ 3.2.34：EGLDisplay 在 +0x10，DMA-BUF 导入缓存的 fd 在 +0x1f4。 */
 static void *linear_dmabuf_capture(const struct pw_stream_events *events, void *data)
 {
-    const char *mode = lookup_env("QQ_WL_DMABUF");
-    if (!mode || strcmp(mode, "linear"))
+    static int logged;
+
+    if (!strcmp(dmabuf_mode(), "off"))
         return NULL;
 #if defined(__x86_64__)
     if (data && events && capture_code_known((const void *)events->process)) {
@@ -749,7 +761,10 @@ static void *linear_dmabuf_capture(const struct pw_stream_events *events, void *
 #else
     (void)events; (void)data;
 #endif
-    LOG("DMA-BUF linear disabled: unknown QQ capture layout", (long)getpid());
+    if (!logged) {
+        logged = 1;
+        LOG("DMA-BUF linear disabled: unknown QQ capture layout", (long)getpid());
+    }
     return NULL;
 }
 
@@ -869,23 +884,33 @@ static int connect_linear_dmabuf(struct pw_stream *stream, int direction,
             (long)getpid());
         goto original;
     }
-    /* Keep the original SHM formats as fallback offers for other producers. */
+    /*
+     * PipeWire 按消费端（QQ）给的顺序挑第一个双方都接受的格式。LINEAR 排在原有格式后面，
+     * 给共享内存的合成器（KDE、GNOME、wlroots 系、新版 niri）照旧协商成共享内存，
+     * 只给 DMA-BUF 的（niri 26.04）才会落到它。
+     */
+    int first = !strcmp(dmabuf_mode(), "first");
     const struct spa_pod *offers[128];
     struct spa_pod *owned[64];
     uint32_t n = 0, added = 0;
     for (uint32_t i = 0; i < n_params; ++i) {
         struct spa_pod *dma = linear_dmabuf_format(params[i]);
-        if (dma) {
+        if (dma)
             owned[added++] = dma;
-            offers[n++] = dma;
-        }
-        offers[n++] = params[i];
     }
     if (!added)
         goto original;
+    if (!first)
+        for (uint32_t i = 0; i < n_params; ++i)
+            offers[n++] = params[i];
+    for (uint32_t i = 0; i < added; ++i)
+        offers[n++] = owned[i];
+    if (first)
+        for (uint32_t i = 0; i < n_params; ++i)
+            offers[n++] = params[i];
     s->dmabuf_linear = 1;
-    LOG("DMA-BUF offer: BGRx modifier=0 (LINEAR), QQ native single-plane import; %u fallback params",
-        (long)getpid(), n_params);
+    LOG("DMA-BUF offer: BGRx modifier=0 (LINEAR) %s %u original params",
+        (long)getpid(), first ? "before" : "after", n_params);
     int result = real_stream_connect(stream, direction, target_id, flags, offers, n);
     for (uint32_t i = 0; i < added; ++i) free(owned[i]);
     return result;
