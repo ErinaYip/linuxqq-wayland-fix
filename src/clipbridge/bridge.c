@@ -212,8 +212,11 @@ static long qq_data(const char *target, unsigned char **out)
     return cache[c].len;
 }
 
-/* 取齐 QQ 这次复制的各种格式；QQ 一次没回应就不再等后面的 */
-static void cache_fill(Window owner, const struct cb_mimes *targets)
+/*
+ * 取齐 QQ 这次复制的各种格式；QQ 一次没回应就不再等后面的。
+ * QQ 回应了却给不出数据的格式（大图放不进一个 X 属性）记进 *missing，不挂到 Wayland 上。
+ */
+static void cache_fill(Window owner, const struct cb_mimes *targets, struct cb_mimes *missing)
 {
     long total = 0;
     for (int i = 0; i < targets->n && n_cache < MAX_MIMES; ++i) {
@@ -222,9 +225,14 @@ static void cache_fill(Window owner, const struct cb_mimes *targets)
             continue;
         unsigned char *data;
         long n = cb_x11_fetch(owner, cb_x11_atom(t), &data);
-        if (n < 0) {
+        if (n == CB_NO_ANSWER) {
             LOG("QQ did not provide %s, not caching the rest", t);
             break;
+        }
+        if (n < 0) {
+            LOG("QQ has no data for %s (too large for one X property?), not offering it", t);
+            cb_mimes_add(missing, t);
+            continue;
         }
         if (total + n > CACHE_LIMIT) {
             free(data);
@@ -292,7 +300,7 @@ static void on_qq_copy(uint32_t generation)
     cache_clear();
     source_owner = owner;
     source_generation = generation;
-    struct cb_mimes targets = { 0 }, offer = { 0 };
+    struct cb_mimes targets = { 0 }, offer = { 0 }, missing = { 0 };
     for (long i = 0; i < n / (long)sizeof(Atom); ++i) {
         Atom a = ((Atom *)raw)[i];
         char *name = cb_x11_name(a);
@@ -303,7 +311,16 @@ static void on_qq_copy(uint32_t generation)
             cached_targets[n_cached_targets++] = a;
     }
     free(raw);
-    cache_fill(owner, &targets);
+    cache_fill(owner, &targets, &missing);
+    if (missing.n) {
+        struct cb_mimes kept = { 0 };
+        for (int i = 0; i < targets.n; ++i)
+            if (!cb_mimes_has(&missing, targets.v[i]))
+                cb_mimes_add(&kept, targets.v[i]);
+        cb_mimes_clear(&targets);
+        targets = kept;
+        cb_mimes_clear(&missing);
+    }
     int files = cb_mimes_has(&targets, "x-special/gnome-copied-files") || cb_mimes_has(&targets, "text/uri-list");
     cb_offers_from_qq(&targets, !files || files_exist(), &offer);
     cb_mimes_clear(&targets);

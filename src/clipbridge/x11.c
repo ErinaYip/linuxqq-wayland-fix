@@ -23,7 +23,10 @@ static Window wake_win;   /* 叫醒 QQ 用的请求的应答落在这里，与�
 
 /*
  * QQ 没有装自己的 X 错误处理，用的是 libX11 默认的：出错就 exit，整个 QQ 跟着退出。
- * 本连接上的错误（比如要写的窗口刚好被销毁）只记一笔；其它连接的照旧交给原来的处理。
+ * 本连接上的错误（比如要写的窗口刚好被销毁）只记一笔。QQ 剪贴板连接上的错误也一样：
+ * 复制很大的图（比如群里的大 GIF）时，QQ 把整张 PNG 一次写进一个属性，超过 X 单个请求的
+ * 上限（16 MB）就是 BadLength，以前 QQ 会直接退出。忽略后连接照常可用（实测），
+ * 只是这一种格式没有数据。其它连接的照旧交给原来的处理。
  */
 static XErrorHandler prev_error;
 
@@ -31,6 +34,10 @@ static int on_x_error(Display *dpy, XErrorEvent *e)
 {
     if (dpy == cb_xdpy) {
         LOG("X error %d (request %d) on the bridge's own connection, ignored", e->error_code, e->request_code);
+        return 0;
+    }
+    if (cb_is_qq_display(dpy)) {
+        LOG("X error %d (request %d) on QQ's clipboard connection, ignored", e->error_code, e->request_code);
         return 0;
     }
     return prev_error ? prev_error(dpy, e) : 0;
@@ -110,7 +117,8 @@ static int wait_notify(Window owner, Atom target, XEvent *ev)
 /*
  * 向 QQ 的复制窗口要 target 格式的数据：不经过 X11 的 CLIPBOARD，直接给这个窗口发 SelectionRequest，
  * QQ 的剪贴板线程照常回应。结果放在 *out（malloc，末尾补 0），返回字节数；失败返回 -1。
- * QQ 不做 INCR 分块（它从不监听属性变化），数据总是一次写完。
+ * QQ 不做 INCR 分块（它从不监听属性变化），数据总是一次写完；放不进一个属性时它回应了却没有数据。
+ * QQ 没回应返回 CB_NO_ANSWER。
  */
 long cb_x11_fetch(Window owner, Atom target, unsigned char **out)
 {
@@ -134,15 +142,20 @@ long cb_x11_fetch(Window owner, Atom target, unsigned char **out)
               !answered ? "no answer" : ev.xselection.property == None ? "refused" : "ok", -ms_left(&t0), nudges);
         free(name);
     }
-    if (!answered || ev.xselection.property == None)
+    if (!answered)
+        return CB_NO_ANSWER;
+    if (ev.xselection.property == None)
         return -1;
     Atom type;
     int format;
     unsigned long nitems, after;
     unsigned char *data = NULL;
     if (XGetWindowProperty(cb_xdpy, cb_xwin, A_PROP, 0, 0x7fffffff, True, AnyPropertyType, &type, &format,
-                           &nitems, &after, &data) != Success || !data)
+                           &nitems, &after, &data) != Success || !data || type == None) {
+        if (data)
+            XFree(data);
         return -1;
+    }
     long len = nitems * (format == 32 ? (long)sizeof(long) : format / 8);
     *out = malloc(len + 1);
     memcpy(*out, data, len);

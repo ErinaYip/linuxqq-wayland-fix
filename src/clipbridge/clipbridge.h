@@ -36,6 +36,7 @@ Window cb_qq_lost(uint32_t generation);
 void cb_go_native(Window proxy, Atom clipboard);
 void cb_go_x11(void);
 void cb_set_foreign(int present);
+int cb_is_qq_display(Display *dpy);
 void cb_wake(void);
 int cb_wake_fd(void);
 
@@ -50,6 +51,7 @@ extern Window cb_xwin;
 extern Atom cb_A_CLIPBOARD, cb_A_TARGETS, cb_A_UTF8, cb_A_GNOME_FILES, cb_A_URI_LIST;
 
 int cb_x11_open(void);
+#define CB_NO_ANSWER (-2)   /* cb_x11_fetch：QQ 没回应（区别于回应了但给不出数据的 -1） */
 long cb_x11_fetch(Window owner, Atom target, unsigned char **out);
 void cb_x11_forward(Window owner, const struct cb_request *r);
 void cb_x11_reply(const struct cb_request *r, Atom type, int format, const void *data, long nitems);

@@ -183,9 +183,40 @@ void cb_set_foreign(int present)
     atomic_store(&foreign, present);
 }
 
+/*
+ * QQ 剪贴板用的 X 连接（复制、粘贴各一条）。这些连接上的 X 错误不能让 QQ 退出，见 x11.c 的 on_x_error。
+ */
+#define MAX_QQ_DISPLAYS 8
+static _Atomic(Display *) qq_displays[MAX_QQ_DISPLAYS];
+
+static void remember_display(Display *dpy)
+{
+    for (int i = 0; i < MAX_QQ_DISPLAYS; ++i) {
+        Display *cur = atomic_load(&qq_displays[i]);
+        if (cur == dpy)
+            return;
+        Display *expected = NULL;
+        if (!cur && atomic_compare_exchange_strong(&qq_displays[i], &expected, dpy))
+            return;
+        if (expected == dpy)
+            return;
+    }
+}
+
+int cb_is_qq_display(Display *dpy)
+{
+    for (int i = 0; i < MAX_QQ_DISPLAYS; ++i)
+        if (atomic_load(&qq_displays[i]) == dpy)
+            return 1;
+    return 0;
+}
+
 static int intercepts(Display *dpy, Atom selection)
 {
-    return atomic_load(&native) && dpy != cb_xdpy && selection == (Atom)atomic_load(&clipboard_atom);
+    if (!atomic_load(&native) || dpy == cb_xdpy || selection != (Atom)atomic_load(&clipboard_atom))
+        return 0;
+    remember_display(dpy);
+    return 1;
 }
 
 /* ---------------- Xlib 拦截 ---------------- */
