@@ -154,6 +154,14 @@ linuxqq-wayland-fix uninstall   # 恢复原样
 
 详细说明见 [常见问题与排错](docs/常见问题与排错.md)。
 
+## 赞助
+
+如果这个项目帮到了你，欢迎请我喝杯咖啡 ☕ 你的支持会让它持续更新下去。
+
+<img src="https://raw.githubusercontent.com/SHORiN-KiWATA/.github/main/images/wechat.jpg" width="200" alt="微信赞赏码"> <img src="https://raw.githubusercontent.com/SHORiN-KiWATA/.github/main/images/alipay.png" width="134" alt="支付宝收款码">
+
+手机上看可以打开 [赞助页](https://github.com/SHORiN-KiWATA/.github/blob/main/SPONSOR.md)，支付宝能直接点链接付款。
+
 ## 致谢
 
 [littlekan233/qq-wayland-screenshare](https://github.com/littlekan233/qq-wayland-screenshare) [xuwd1/wemeet-wayland-screenshare](https://github.com/xuwd1/wemeet-wayland-screenshare)：「截屏中转」思路的先行者。本项目采用了不同的方法，不包含它们的代码。
